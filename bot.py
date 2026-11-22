@@ -1,4 +1,5 @@
-"""Бот-магазин: каталог, кнопки «Заказать» (Telegram и WhatsApp), добавление товаров владельцем."""
+"""Бот для владельца магазина: добавляете товар в боте, он сам публикуется в канале
+с кнопками «Написать в Telegram», «Написать в WhatsApp» и «Позвонить»."""
 import json
 import logging
 import os
@@ -23,19 +24,34 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("shop-bot")
 
-# ---------- Настройки (берутся из переменных окружения на хостинге) ----------
+
+def digits(value: str) -> str:
+    return "".join(ch for ch in value if ch.isdigit())
+
+
+# ---------- Настройки (переменные окружения на хостинге) ----------
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "mahdiashop_01").lstrip("@")
-WHATSAPP_NUMBER = "".join(ch for ch in os.environ.get("WHATSAPP_NUMBER", "") if ch.isdigit())
+WHATSAPP_NUMBER = digits(os.environ.get("WHATSAPP_NUMBER", ""))
+PHONE_NUMBER = digits(os.environ.get("PHONE_NUMBER", "")) or WHATSAPP_NUMBER
 SHOP_NAME = os.environ.get("SHOP_NAME", "наш магазин")
 DATA_FILE = os.environ.get("DATA_FILE", "products.json")
+
+CHANNEL_RAW = os.environ.get("CHANNEL_ID", "").strip()
+CHANNEL = int(CHANNEL_RAW) if CHANNEL_RAW.lstrip("-").isdigit() else CHANNEL_RAW
+CHANNEL_LINK = os.environ.get("CHANNEL_LINK", "").strip() or (
+    f"https://t.me/{CHANNEL_RAW.lstrip('@')}" if CHANNEL_RAW.startswith("@") else ""
+)
 
 OWNER_ID_INT = int(OWNER_ID) if OWNER_ID.isdigit() else 0
 OWNER = filters.User(user_id=OWNER_ID_INT)
 
-CATEGORIES = ["👶 Детская одежда", "🛏 Постельное бельё"]
-PAGE = 5  # сколько товаров показывать за раз
+# (название раздела, хэштег в канале)
+CATEGORIES = [
+    ("👶 Детская одежда", "#детская_одежда"),
+    ("🛏 Постельное бельё", "#постельное_бельё"),
+]
 
 
 # ---------- Хранение товаров ----------
@@ -58,7 +74,7 @@ def is_owner(update: Update) -> bool:
     return bool(OWNER_ID_INT) and user is not None and user.id == OWNER_ID_INT
 
 
-# ---------- Карточка товара ----------
+# ---------- Пост в канале ----------
 
 def caption(p: dict) -> str:
     lines = [p["name"], ""]
@@ -67,19 +83,23 @@ def caption(p: dict) -> str:
     if p.get("sizes"):
         lines.append(f"Размеры: {p['sizes']}")
     if p.get("description"):
-        lines += ["", p["description"]]
-    return "\n".join(lines)[:900]
+        lines += ["", p["description"][:600]]
+    lines += ["", CATEGORIES[p["category"]][1]]
+    if PHONE_NUMBER:
+        lines.append(f"📞 +{PHONE_NUMBER}")
+    lines.append(f"Артикул: {p['id']}")
+    return "\n".join(lines)[:1000]
 
 
-def order_keyboard(p: dict) -> InlineKeyboardMarkup:
-    text = f"Здравствуйте! Хочу заказать: {p['name']}"
+def order_keyboard(p: dict, bot_username: str) -> InlineKeyboardMarkup:
+    text = f"Здравствуйте! Хочу заказать: {p['name']} (арт. {p['id']})"
     if p.get("price"):
-        text += f" ({p['price']})"
+        text += f", {p['price']}"
     text += ". Размер: "
     rows = [
         [
             InlineKeyboardButton(
-                "✅ Заказать в Telegram",
+                "✈️ Написать в Telegram",
                 url=f"https://t.me/{OWNER_USERNAME}?text={quote(text)}",
             )
         ]
@@ -88,94 +108,66 @@ def order_keyboard(p: dict) -> InlineKeyboardMarkup:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "🟢 Заказать в WhatsApp",
+                    "🟢 Написать в WhatsApp",
                     url=f"https://wa.me/{WHATSAPP_NUMBER}?text={quote(text)}",
                 )
             ]
         )
+    if PHONE_NUMBER and bot_username:
+        rows.append(
+            [InlineKeyboardButton("📞 Позвонить", url=f"https://t.me/{bot_username}?start=call")]
+        )
     return InlineKeyboardMarkup(rows)
 
 
-def home_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(name, callback_data=f"cat:{i}:0")]
-        for i, name in enumerate(CATEGORIES)
-    ]
-    rows.append(
-        [InlineKeyboardButton("💬 Написать в магазин", url=f"https://t.me/{OWNER_USERNAME}")]
+async def publish(bot, p: dict) -> int:
+    """Публикует товар в канале и возвращает номер сообщения."""
+    if not CHANNEL:
+        raise RuntimeError("не указан CHANNEL_ID")
+    msg = await bot.send_photo(
+        CHANNEL,
+        p["photo"],
+        caption=caption(p),
+        reply_markup=order_keyboard(p, bot.username),
     )
-    return InlineKeyboardMarkup(rows)
+    return msg.message_id
 
 
-async def send_card(bot, chat_id: int, p: dict, markup) -> None:
-    try:
-        await bot.send_photo(chat_id, p["photo"], caption=caption(p), reply_markup=markup)
-    except Exception as e:  # например, фото больше недоступно
-        log.warning("Фото не отправилось: %s", e)
-        await bot.send_message(chat_id, caption(p), reply_markup=markup)
-
-
-# ---------- Для клиентов ----------
+# ---------- /start (для всех) ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"Добро пожаловать в {SHOP_NAME}! Выберите раздел:",
-        reply_markup=home_keyboard(),
-    )
+    # Кнопка «Позвонить» из канала ведёт сюда
+    if context.args and context.args[0] == "call" and PHONE_NUMBER:
+        await update.message.reply_text("Нажмите на контакт, чтобы позвонить 👇")
+        await update.message.reply_contact(phone_number=f"+{PHONE_NUMBER}", first_name=SHOP_NAME)
+        return
+
     if is_owner(update):
         await update.message.reply_text(
             "Команды владельца:\n"
-            "/add - добавить товар\n"
+            "/add - добавить товар (сразу появится в канале)\n"
             "/list - список товаров и удаление\n"
             "/backup - сохранить копию товаров"
         )
+        return
+
+    rows = []
+    if CHANNEL_LINK:
+        rows.append([InlineKeyboardButton("🛍 Перейти в канал с товарами", url=CHANNEL_LINK)])
+    rows.append(
+        [InlineKeyboardButton("✈️ Написать в магазин", url=f"https://t.me/{OWNER_USERNAME}")]
+    )
+    await update.message.reply_text(
+        f"Добро пожаловать в {SHOP_NAME}! Все товары в нашем канале.",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
 
 
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ваш ID: {update.effective_user.id}")
 
 
-async def on_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await context.bot.send_message(
-        q.message.chat_id, "Выберите раздел:", reply_markup=home_keyboard()
-    )
-
-
-async def on_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, idx, off = q.data.split(":")
-    idx, off = int(idx), int(off)
-    chat_id = q.message.chat_id
-
-    items = [p for p in load_data()["products"] if p["category"] == idx]
-    items.reverse()  # новые сверху
-
-    back = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="home")]])
-    if not items:
-        await context.bot.send_message(
-            chat_id, "В этом разделе пока ничего нет. Загляните позже!", reply_markup=back
-        )
-        return
-
-    for p in items[off : off + PAGE]:
-        await send_card(context.bot, chat_id, p, order_keyboard(p))
-
-    rest = len(items) - (off + PAGE)
-    buttons = []
-    if rest > 0:
-        buttons.append(
-            [InlineKeyboardButton(f"Показать ещё ({rest})", callback_data=f"cat:{idx}:{off + PAGE}")]
-        )
-    buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="home")])
-    await context.bot.send_message(
-        chat_id, "Выберите товар или вернитесь в меню:", reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ---------- Для владельца: добавление товара ----------
+# ---------- Добавление товара (владелец) ----------
 
 PHOTO, NAME, PRICE, SIZES, CATEGORY, DESC = range(6)
 TEXT = filters.TEXT & ~filters.COMMAND
@@ -217,7 +209,7 @@ async def add_sizes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new"]["sizes"] = "" if text == "-" else text
     buttons = [
         [InlineKeyboardButton(name, callback_data=f"addcat:{i}")]
-        for i, name in enumerate(CATEGORIES)
+        for i, (name, _tag) in enumerate(CATEGORIES)
     ]
     await update.message.reply_text("В какой раздел?", reply_markup=InlineKeyboardMarkup(buttons))
     return CATEGORY
@@ -228,7 +220,7 @@ async def add_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     idx = int(q.data.split(":")[1])
     context.user_data["new"]["category"] = idx
-    await q.edit_message_text(f"Раздел: {CATEGORIES[idx]}")
+    await q.edit_message_text(f"Раздел: {CATEGORIES[idx][0]}")
     await context.bot.send_message(
         q.message.chat_id, "Описание товара? Если не нужно, отправьте знак -"
     )
@@ -242,12 +234,23 @@ async def add_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = load_data()
     product["id"] = data["next_id"]
+
+    try:
+        product["channel_msg"] = await publish(context.bot, product)
+    except Exception as e:
+        log.error("Не удалось опубликовать: %s", e)
+        await update.message.reply_text(
+            f"Не получилось опубликовать в канале: {e}\n\n"
+            "Проверьте, что бот добавлен в канал как администратор "
+            "и в настройках указан правильный CHANNEL_ID. "
+            "Потом снова нажмите /add."
+        )
+        return ConversationHandler.END
+
     data["next_id"] += 1
     data["products"].append(product)
     save_data(data)
-
-    await update.message.reply_text("Товар добавлен ✅ Вот как его увидят клиенты:")
-    await send_card(context.bot, update.effective_chat.id, product, order_keyboard(product))
+    await update.message.reply_text("Товар добавлен и опубликован в канале ✅")
     return ConversationHandler.END
 
 
@@ -257,7 +260,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------- Для владельца: список, удаление, копия ----------
+# ---------- Список, удаление, копия (владелец) ----------
 
 async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     items = load_data()["products"]
@@ -265,12 +268,15 @@ async def admin_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Товаров пока нет. Добавьте: /add")
         return
     for p in items:
-        cat = CATEGORIES[p["category"]] if 0 <= p["category"] < len(CATEGORIES) else "?"
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("🗑 Удалить", callback_data=f"del:{p['id']}")]]
         )
-        card = dict(p, name=f"#{p['id']} · {cat}\n{p['name']}")
-        await send_card(context.bot, update.effective_chat.id, card, markup)
+        try:
+            await context.bot.send_photo(
+                update.effective_chat.id, p["photo"], caption=caption(p), reply_markup=markup
+            )
+        except Exception:
+            await update.message.reply_text(caption(p), reply_markup=markup)
 
 
 async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -299,19 +305,32 @@ async def on_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_reply_markup(markup)
     elif action == "delyes":
         data = load_data()
+        product = next((p for p in data["products"] if p["id"] == pid), None)
         data["products"] = [p for p in data["products"] if p["id"] != pid]
         save_data(data)
+
+        removed_from_channel = False
+        if product and product.get("channel_msg") and CHANNEL:
+            try:
+                await context.bot.delete_message(CHANNEL, product["channel_msg"])
+                removed_from_channel = True
+            except Exception as e:
+                log.warning("Не удалось удалить пост в канале: %s", e)
+
+        note = "Удалено ✅" if removed_from_channel else (
+            "Удалено из списка ✅\nПост в канале удалите вручную."
+        )
         try:
-            await q.edit_message_caption("Удалено ✅")
+            await q.edit_message_caption(note)
         except Exception:
-            await q.edit_message_text("Удалено ✅")
+            await q.edit_message_text(note)
 
 
 async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = json.dumps(load_data(), ensure_ascii=False, indent=2).encode("utf-8")
     await update.message.reply_document(
         InputFile(raw, filename="products.json"),
-        caption="Копия товаров. Если товары пропадут, просто отправьте этот файл мне обратно.",
+        caption="Копия товаров. Если список пропадёт, просто отправьте этот файл мне обратно.",
     )
 
 
@@ -355,8 +374,6 @@ def main():
     app.add_handler(
         MessageHandler(filters.Document.FileExtension("json") & OWNER, restore)
     )
-    app.add_handler(CallbackQueryHandler(on_category, pattern="^cat:"))
-    app.add_handler(CallbackQueryHandler(on_home, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(on_delete, pattern="^(del|delyes|delno):"))
     app.run_polling()
 
