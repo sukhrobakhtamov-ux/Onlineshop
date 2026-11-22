@@ -41,10 +41,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "mahdiashop_01").lstrip("@")
 WHATSAPP_NUMBER = digits(os.environ.get("WHATSAPP_NUMBER", ""))
-PHONE_NUMBER = digits(os.environ.get("PHONE_NUMBER", "")) or WHATSAPP_NUMBER
 SHOP_NAME = os.environ.get("SHOP_NAME", "наш магазин")
 DATA_FILE = os.environ.get("DATA_FILE", "products.json")
-CALL_PAGE_URL = os.environ.get("CALL_PAGE_URL", "").strip()  # страница call.html на GitHub Pages
 
 CHANNEL_RAW = os.environ.get("CHANNEL_ID", "").strip()
 CHANNEL = int(CHANNEL_RAW) if CHANNEL_RAW.lstrip("-").isdigit() else CHANNEL_RAW
@@ -243,8 +241,8 @@ def caption(p: dict, sold: bool = False) -> str:
     if p.get("description"):
         lines += ["", f"📝 {p['description'][:500]}"]
     lines += ["", t["tags"]]
-    if PHONE_NUMBER:
-        lines.append(f"📞 +{PHONE_NUMBER}")
+    if WHATSAPP_NUMBER:
+        lines.append(f"🟢 WhatsApp: +{WHATSAPP_NUMBER}")
     lines.append(f"🔖 Артикул: {p['article']}")
     text = "\n".join(lines)[:1000]
     return ("🔴 ПРОДАНО\n\n" + text) if sold else text
@@ -272,12 +270,10 @@ def order_keyboard(p: dict, bot_username: str) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    if PHONE_NUMBER:
-        if CALL_PAGE_URL:
-            call_url = f"{CALL_PAGE_URL}?n={PHONE_NUMBER}"
-        else:
-            call_url = f"https://t.me/{bot_username}?start=call"
-        rows.append([InlineKeyboardButton("📞 Позвонить", url=call_url)])
+    if WHATSAPP_NUMBER:
+        rows.append(
+            [InlineKeyboardButton("📞 Позвонить в WhatsApp", url=f"https://wa.me/{WHATSAPP_NUMBER}")]
+        )
     return InlineKeyboardMarkup(rows)
 
 
@@ -296,8 +292,6 @@ def instagram_text(p: dict) -> str:
     lines.append(f"✈️ Telegram: @{OWNER_USERNAME}")
     if WHATSAPP_NUMBER:
         lines.append(f"🟢 WhatsApp: +{WHATSAPP_NUMBER}")
-    if PHONE_NUMBER:
-        lines.append(f"📞 Звонок: +{PHONE_NUMBER}")
     lines += ["", f"🔖 Артикул: {p['article']}", "", t["ig"]]
     return "\n".join(lines)
 
@@ -334,12 +328,6 @@ async def update_channel(bot, p: dict) -> str:
 # ---------- /start ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Кнопка «Позвонить» без страницы-перехода приводит сюда
-    if context.args and context.args[0] == "call" and PHONE_NUMBER:
-        await update.message.reply_text("Нажмите на контакт, чтобы позвонить 👇")
-        await update.message.reply_contact(phone_number=f"+{PHONE_NUMBER}", first_name=SHOP_NAME)
-        return
-
     if is_owner(update):
         await update.message.reply_text("Меню владельца внизу экрана 👇", reply_markup=MENU)
         return
